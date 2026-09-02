@@ -1,0 +1,425 @@
+---
+title: 'Partie 1 : Modélisation des notations Yuka'
+author: "Ibrahima Fa LO & Fanny LATTARD & Baptiste COMBY"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4
+)
+
+# --- Chargement de tous les packages en un seul endroit ---
+library(dplyr)
+library(ggplot2)
+library(Rchoice)
+library(MASS)
+library(corrplot)
+library(pROC)
+library(caret)
+library(effects)
+library(here)        # gestion portable des chemins
+```
+
+```{r chargement-donnees}
+# here::here() construit le chemin depuis la racine du projet,
+# quelle que soit la machine ou le répertoire de travail courant.
+setwd("~/Econométrie")
+
+base_yuka <- read.csv("jeu_donnees_yuka.csv",sep=";")
+
+# Encodage de la variable dépendante comme facteur ordonné
+base_yuka$classe_yuka <- factor(
+  base_yuka$classe_yuka,
+  levels  = c("Mauvais", "Médiocre", "Bon", "Excellent"),
+  ordered = TRUE
+)
+```
+
+# Spécification du modèle et justification
+
+La variable dépendante `classe_yuka` est une variable qualitative ordonnée à 4 modalités (1 : Mauvais, 2 : Médiocre, 3 : Bon, 4 : Excellent). L'utilisation d'une régression linéaire classique (MCO) serait inappropriée car elle supposerait des écarts identiques entre chaque score.
+
+Nous utilisons donc un **modèle Logit Ordonné (Ordered Logit)**. Ce modèle repose sur l'existence d'une variable latente $Y_i^*$ telle que :
+
+$$Y_i^* = X_i \beta + \varepsilon_i$$
+
+La note observée $Y_i$ dépend de la position de $Y_i^*$ par rapport à des seuils critiques ($\alpha_k$) :
+
+-   $Y_i = 1$ si $Y_i^* \leq \alpha_1$\
+-   $Y_i = 2$ si $\alpha_1 < Y_i^* \leq \alpha_2$\
+-   $Y_i = 3$ si $\alpha_2 < Y_i^* \leq \alpha_3$\
+-   $Y_i = 4$ si $Y_i^* > \alpha_3$
+
+# Statistiques descriptives
+
+```{r stats-descriptives}
+summary(base_yuka)
+base_yuka$bio <- as.factor(base_yuka$bio)
+base_yuka$ultra_transforme <- as.factor(base_yuka$ultra_transforme)
+summary(base_yuka)
+```
+
+```{r graphique-distribution}
+ggplot(base_yuka, aes(x = classe_yuka, fill = classe_yuka)) +
+  geom_bar(show.legend = FALSE) +
+  scale_fill_brewer(palette = "RdYlGn") +
+  labs(
+    title = "Répartition des scores Yuka",
+    x     = "Score Yuka",
+    y     = "Nombre de produits"
+  ) +
+  theme_minimal()
+```
+
+```{r matrice-correlation}
+# Sélection des variables numériques
+# (on évite d'appeler l'objet "cor" pour ne pas masquer base::cor())
+vars_num <- base_yuka %>%
+  dplyr::select(
+    calories_100g, sucres_100g, graisses_saturees_100g,
+    sel_100g, fibres_100g, proteines_100g,
+    nb_additifs
+  )
+
+mat_cor <- cor(vars_num, use = "complete.obs")
+
+corrplot(
+  mat_cor,
+  method  = "color",
+  type    = "upper",
+  tl.col  = "black",
+  addCoef.col = "black",
+  number.cex  = 0.7,
+  title   = "Matrice de corrélation",
+  mar     = c(0, 0, 1, 0)
+)
+```
+
+```{r}
+vars_continues <- c("calories_100g", "sucres_100g", "sel_100g", 
+                    "graisses_saturees_100g", "fibres_100g", "proteines_100g")
+# Diviser l'affichage en 2 lignes et 3 colonnes
+par(mfrow = c(2, 3))
+
+# Tracer les boxplots un par un
+boxplot(calories_100g ~ classe_yuka, data = base_yuka, main = "Calories", col = "lightblue")
+boxplot(sucres_100g ~ classe_yuka, data = base_yuka, main = "Sucres", col = "orange")
+boxplot(sel_100g ~ classe_yuka, data = base_yuka, main = "Sel", col = "grey")
+boxplot(graisses_saturees_100g ~ classe_yuka, data = base_yuka, main = "Gras Sat.", col = "pink")
+boxplot(fibres_100g ~ classe_yuka, data = base_yuka, main = "Fibres", col = "lightgreen")
+boxplot(proteines_100g ~ classe_yuka, data = base_yuka, main = "Protéines", col = "tan")
+
+# Très important : réinitialiser l'affichage à 1 seul graphique après
+par(mfrow = c(1, 1))
+
+# Test de corrélation (Anova) pour vérifier si les moyennes diffèrent par groupe
+# Comme nous avons 4 groupes, on utilise l'ANOVA (ou t-test si binaire)
+lapply(vars_continues, function(v) {
+  formula <- as.formula(paste(v, "~ classe_yuka"))
+  summary(aov(formula, data = base_yuka))
+})
+```
+
+```{r}
+# Croisement Bio / Note Yuka
+tab_bio <- table(base_yuka$bio, base_yuka$classe_yuka)
+rownames(tab_bio) <- c("Non-Bio", "Bio")
+cat("\nTableau de contingence : Bio vs Note Yuka\n")
+print(tab_bio)
+
+# En pourcentages (Profils colonnes pour voir la part de Bio dans chaque note)
+cat("\nPourcentages (Profils colonnes) :\n")
+print(round(prop.table(tab_bio, margin = 2) * 100, 2))
+
+# Croisement Ultra-transformé / Note Yuka
+tab_nova <- table(base_yuka$ultra_transforme, base_yuka$classe_yuka)
+rownames(tab_nova) <- c("Brut/Transformé", "Ultra-transformé")
+cat("\nTableau de contingence : Ultra-transformé vs Note Yuka\n")
+print(tab_nova)
+```
+
+```{r}
+# Test du Chi-deux pour le Bio
+chi_bio <- chisq.test(tab_bio)
+cat("\nTest du Chi-deux pour le Bio :\n")
+print(chi_bio)
+
+# Test du Chi-deux pour l'Ultra-transformé
+chi_nova <- chisq.test(tab_nova)
+cat("\nTest du Chi-deux pour l'Ultra-transformé :\n")
+print(chi_nova)
+```
+
+```{r}
+# Visualisation groupée (1 ligne, 2 colonnes)
+par(mfrow = c(1, 2))
+barplot(prop.table(tab_bio, 2), beside = TRUE, legend = c("Non-Bio", "Bio"), main = "Répartition Bio")
+barplot(prop.table(tab_nova, 2), beside = TRUE, legend = c("Non-UT", "UT"), main = "Répartition Ultra-Transfo")
+par(mfrow = c(1, 1))
+```
+```{r}
+#graphique pour voir la répartion des scores en fonction de la transformation ou non 
+ggplot(base_yuka, aes(x = ultra_transforme, fill = classe_yuka)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "RdYlGn") + 
+  labs(title = "Répartition des scores Yuka par degré de transformation",
+       x = "Ultra-transformé (0 = Non, 1 = Oui)", y = "Pourcentage", fill = "Note Yuka") +
+  theme_minimal()
+
+ggplot(base_yuka, aes(x = bio, fill = classe_yuka)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "RdYlGn") + 
+  labs(title = "Répartition des scores Yuka pour produit bio ou non",
+       x = "Bio (0 = Non, 1 = Oui)", y = "Pourcentage", fill = "Note Yuka") +
+  theme_minimal()
+```
+
+# Estimation du modèle Logit Ordonné
+
+```{r estimation-modele}
+formule_yuka <- classe_yuka ~ calories_100g + sucres_100g + sel_100g +
+                              graisses_saturees_100g + nb_additifs +
+                              fibres_100g + proteines_100g + bio + ultra_transforme
+
+# Estimation via Rchoice (pour les résultats détaillés)
+modele_yuka <- Rchoice(formule_yuka, data = base_yuka, family = ordinal("logit"))
+summary(modele_yuka)
+#ajout du modèle simplifié 
+simple_yuka <- classe_yuka ~  sucres_100g + sel_100g + graisses_saturees_100g 
+modele_test_yuka <- Rchoice(simple_yuka, data = base_yuka, family = ordinal("logit"))
+summary(modele_test_yuka)
+
+
+#----- Test AIC et BIC----------
+
+## Modèle complet
+modele_complet <- polr(formule_yuka, data = base_yuka, Hess = TRUE)
+
+# Modèle réduit (sans les additifs)
+formule_reduite <- update(formule_yuka, . ~ . - nb_additifs)
+modele_reduit <- polr(formule_reduite, data = base_yuka, Hess = TRUE)
+
+#Modèle simplifié
+simple_polr <- polr(simple_yuka, data = base_yuka, Hess = TRUE)
+
+# Comparaison via un tableau
+AIC(modele_complet, modele_reduit, modele_test_yuka)
+BIC(modele_complet, modele_reduit, modele_test_yuka)
+```
+
+
+```{r estimation-modele}
+
+# --- polr pour les prédictions (mêmes coefficients que Rchoice) ---
+modele_polr <- polr(formule_yuka, data = base_yuka, Hess = TRUE)
+#pour modele simplifié
+simple_polr <- polr(simple_yuka, data = base_yuka, Hess = TRUE)
+
+# --- Matrice de confusion ---
+classe_predite <- predict(modele_polr, type = "class")
+
+confusionMatrix(
+  data      = classe_predite,
+  reference = base_yuka$classe_yuka
+)
+
+#pour modele simplifié
+classe_predite2 <- predict(simple_polr, type = "class")
+
+confusionMatrix(
+  data      = classe_predite,
+  reference = base_yuka$classe_yuka
+)
+
+```
+
+
+```{r estimation-modele}
+#-----test des pentes------
+install.packages("brant")
+library(brant)
+# Exécution du test de Brant
+test_brant <- brant(modele_polr)
+print(test_brant)
+#test de Brant modèle simplifié
+test_brant2 <- brant(simple_polr)
+print(test_brant2)
+```
+
+En logit ordonné, les effets marginaux permettent de dire :"Si le sucre augmente de 1g, la probabilité d'être classé 'Excellent' diminue de X %"
+
+```{r estimation-modele}
+
+install.packages("margins")
+library(margins)
+# pour le modèle polr 
+# 'summary' donnera les effets marginaux moyens (AME)
+effets_marg_alt <- margins(modele_polr)
+summary(effets_marg_alt)
+#pour modèle simplifié
+effets_marg_alt2 <- margins(simple_polr)
+summary(effets_marg_alt2)
+```
+
+Contrairement à une régression linéaire, il n'y a pas de $R^2$ classique. Pour mesurer la qualité globale de votre modèle, on utilise le Pseudo $R^2$ de McFadden.
+
+```{r estimation-modele}
+#pour modele polr
+library(pscl)
+pR2(modele_polr)
+pR2(simple_polr)
+```
+
+ou avec la formule qui est : $1 - (\text{LogLik}_{\text{modèle}} / \text{LogLik}_{\text{constante}})$
+
+```{r estimation-modele}
+# Modèle avec uniquement l'intercept (constante)
+modele_null <- polr(classe_yuka ~ 1, data = base_yuka)
+
+# Calcul du Pseudo-R2
+as.numeric(1 - logLik(modele_polr) / logLik(modele_null))
+#Calcul du Pseudo-R2 pour modèle simplifié
+as.numeric(1 - logLik(simple_polr) / logLik(modele_null))
+
+```
+
+
+```{r}
+# --- Courbe ROC (classe "Excellent") ---
+prob_mat <- predict(modele_polr, type = "probs")
+
+roc_obj <- roc(
+  response  = as.integer(base_yuka$classe_yuka == "Excellent"),
+  predictor = prob_mat[, "Excellent"],
+  quiet     = TRUE
+)
+
+plot(roc_obj, col = "royalblue", lwd = 2,
+     main = sprintf("Courbe ROC — Excellent  (AUC = %.3f)", auc(roc_obj)))
+abline(a = 0, b = 1, lty = 2, col = "grey70")
+
+#----Courbe ROC pour modèle simplifié------
+prob_mat2 <- predict(simple_polr, type = "probs")
+
+roc_obj2 <- roc(
+  response  = as.integer(base_yuka$classe_yuka == "Excellent"),
+  predictor = prob_mat2[, "Excellent"],
+  quiet     = TRUE
+)
+
+plot(roc_obj2, col = "pink", lwd = 2,
+     main = sprintf("Courbe ROC — Excellent  (AUC = %.3f)", auc(roc_obj2)))
+abline(a = 0, b = 1, lty = 2, col = "grey7")
+```
+
+```{r}
+# Extraction des coefficients (beta) du modèle
+coeffs <- coef(modele_yuka)
+
+# Calcul des Odds Ratios (OR)
+odds_ratios <- exp(coeffs)
+
+# Création d'un tableau propre
+resultats_or <- data.frame(
+  Coefficient = coeffs,
+  Odds_Ratio = odds_ratios
+)
+
+# Filtrage pour ne garder que les variables explicatives (on exclut les seuils kappa/constant)
+# On cherche les lignes qui ne contiennent pas "kappa" ou "constant"
+tableau_interpretation <- resultats_or %>%
+  filter(!grepl("kappa|constant", rownames(resultats_or)))
+
+tableau_interpretation
+```
+```{r}
+# Extraction des coefficients (beta) du modèle simplifié
+coeffs2 <- coef(modele_test_yuka)
+# Calcul des Odds Ratios (OR)
+odds_ratios2 <- exp(coeffs2)
+# Création d'un tableau propre
+resultats_or2 <- data.frame(
+  Coefficient = coeffs2,
+  Odds_Ratio = odds_ratios2
+)
+# Filtrage pour ne garder que les variables explicatives (on exclut les seuils kappa/constant)
+# On cherche les lignes qui ne contiennent pas "kappa" ou "constant"
+tableau_interpretation <- resultats_or2 %>%
+  filter(!grepl("kappa|constant", rownames(resultats_or2)))
+
+tableau_interpretation
+
+
+```
+
+```{r}
+# Exemple pour la variable sucre 
+
+plot(effect("sucres_100g", modele_polr), 
+     main = "Probabilité des scores selon le taux de sucre")
+
+#Pour variable sel
+plot(effect("sel_100g", modele_polr),
+     main = "Probabilité des scores selon le taux de sel")
+
+#pour variable gras
+plot(effect("graisses_saturees_100g", modele_polr),
+     main = "Probabilité des scores selon le taux de graisses saturées")
+
+#pour variables fibres
+plot(effect("fibres_100g", modele_polr),
+     main = "Probabilité des scores selon le taux de fibres")
+
+#pour variable protéine
+plot(effect("proteines_100g", modele_polr),
+     main = "Probabilité des scores selon le taux de protéines")
+
+```
+```{r}
+
+# On s'assure que le tableau contient les variables du modèle
+# On utilise le tableau issu de resultats_or 
+tableau_graphique <- resultats_or %>%
+  filter(!grepl("kappa|constant", rownames(resultats_or)))
+
+# Puis création du Forest Plot
+ggplot(tableau_graphique, aes(x = reorder(rownames(tableau_graphique), Odds_Ratio), y = Odds_Ratio)) +
+  # Ajout d'une ligne verticale à 1 (seuil de neutralité)
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 0.8) +
+  # Points pour les Odds Ratios
+  geom_point(size = 4, color = "#2c3e50") +
+  # Coordonnées inversées pour une lecture facile des noms de variables
+  coord_flip() +
+  # Échelle logarithmique (recommandé pour les Odds Ratios)
+  scale_y_log10() +
+  labs(
+    title = "Déterminants du Score Yuka (Odds Ratios)",
+    subtitle = "Impact des nutriments, additifs et labels",
+    x = "Variables explicatives",
+    y = "Odds Ratio (échelle log)",
+    caption = "Source : Analyse base_yuka"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
